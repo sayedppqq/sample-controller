@@ -32,3 +32,10 @@ Code gen is needed for generating:
 Just create a yaml file like `manifests/kluster.yaml` and apply.
 
 Run `kubectl get Kluster`
+
+## Resource ##
+https://www.linkedin.com/pulse/kubernetes-custom-controllers-part-1-kritik-sachdeva/
+
+https://www.linkedin.com/pulse/kubernetes-custom-controller-part-2-kritik-sachdeva/
+
+https://github.com/ishtiaqhimel/crd-controller/tree/master
