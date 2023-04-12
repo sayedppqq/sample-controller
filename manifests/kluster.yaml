@@ -1,0 +1,10 @@
+apiVersion: sayedppqq.dev/v1alpha1
+kind: Kluster
+metadata:
+  name: example
+spec:
+  name: kustom
+  container:
+    image: sayedppqq/api-server
+    port: 8080
+  replicas: 4
