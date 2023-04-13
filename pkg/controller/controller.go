@@ -12,6 +12,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	appsinformer "k8s.io/client-go/informers/apps/v1"
@@ -65,13 +66,16 @@ func NewController(
 	log.Println("setting up event handler")
 
 	//set up event handler when Kluster resource changes
-	klusterInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, err := klusterInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: controller.enqueueKluster,
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			controller.enqueueKluster(newObj)
 		},
 		DeleteFunc: controller.enqueueKluster,
 	})
+	if err != nil {
+		return nil
+	}
 	return controller
 }
 
@@ -191,26 +195,26 @@ func (c *Controller) syncHandler(key string) error {
 	if err != nil {
 		// The Kluster resource may no longer exist, in which case we stop processing.
 		if errors.IsNotFound(err) {
-			runtime.HandleError(fmt.Errorf("Kluster '%s' in work queue no longer exists", key))
+			fmt.Printf("Kluster '%s' in work queue no longer exists\n", key)
 			return nil
 		}
 		return nil
 	}
 
-	deploymentName := kluster.Spec.Name
-	if deploymentName == "" {
-		// We choose to absorb the error here as the worker would requeue the
-		// resource otherwise. Instead, the next time the resource is updated
-		// the resource will be queued again.
-		runtime.HandleError(fmt.Errorf("%s : deployment name must be specified", key))
-		return nil
+	// Setting up deployment name
+	deploymentName := kluster.Name + "-" + kluster.Spec.Name
+	if kluster.Spec.Name == "" {
+		// If deployment name is not specified in yaml file then
+		// "random-name" will be count as deployment name.
+		// This will also can uniquely identify a deployment
+		deploymentName = kluster.Name + "-" + "random-name"
 	}
 
 	// Get the deployment with the name specified in Kluster.spec
 	deployment, err := c.deploymentsLister.Deployments(namespace).Get(deploymentName)
 	// If the resource doesn't exist, we'll create it
 	if errors.IsNotFound(err) {
-		deployment, err = c.kubeclientset.AppsV1().Deployments(namespace).Create(context.TODO(), newDeployment(kluster), metav1.CreateOptions{})
+		deployment, err = c.kubeclientset.AppsV1().Deployments(namespace).Create(context.TODO(), newDeployment(kluster, deploymentName), metav1.CreateOptions{})
 	}
 
 	// If an error occurs during Get/Create, we'll requeue the item, so we can
@@ -226,7 +230,7 @@ func (c *Controller) syncHandler(key string) error {
 	if kluster.Spec.Replicas != nil && *kluster.Spec.Replicas != *deployment.Spec.Replicas {
 		log.Printf("%s replicas: %d but Deployment replicas: %d\n", name, *kluster.Spec.Replicas, *deployment.Spec.Replicas)
 
-		deployment, err = c.kubeclientset.AppsV1().Deployments(namespace).Update(context.TODO(), newDeployment(kluster), metav1.UpdateOptions{})
+		deployment, err = c.kubeclientset.AppsV1().Deployments(namespace).Update(context.TODO(), newDeployment(kluster, deploymentName), metav1.UpdateOptions{})
 
 		// If an error occurs during Update, we'll requeue the item, so we can
 		// attempt processing again later. This could have been caused by a
@@ -239,39 +243,75 @@ func (c *Controller) syncHandler(key string) error {
 	// Finally, we update the status block of the Kluster resource to reflect the
 	// current state of the world
 	err = c.updateKlusterStatus(kluster, deployment)
+	if err != nil {
+		return err
+	}
+
+	//serviceName is made with deploymentName to uniquely identify
+	serviceName := deploymentName + "-service"
+
+	// Check if service already exists or not
+	service, err := c.kubeclientset.CoreV1().Services(namespace).Get(context.TODO(), serviceName, metav1.GetOptions{})
+	if errors.IsNotFound(err) {
+		service, err = c.kubeclientset.CoreV1().Services(namespace).Create(context.TODO(), newService(kluster, serviceName), metav1.CreateOptions{})
+		if err != nil {
+			return err
+		}
+		log.Printf("service %s created .....\n", service.Name)
+	} else if err != nil {
+		return err
+	}
+
+	//If pods gets updated, service will also update.
+	_, err = c.kubeclientset.CoreV1().Services(namespace).Update(context.TODO(), service, metav1.UpdateOptions{})
 
 	if err != nil {
 		return err
 	}
+
 	return nil
 }
 
 // newDeployment creates a new Deployment for a Kluster resource. It also sets
 // the appropriate OwnerReferences on the resource so handleObject can discover
 // the Kluster resource that 'owns' it.
-func newDeployment(kluster *controllerv1alpha1.Kluster) *appsv1.Deployment {
+func newDeployment(kluster *controllerv1alpha1.Kluster, deploymentName string) *appsv1.Deployment {
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      kluster.Spec.Name,
+			Name:      deploymentName,
 			Namespace: kluster.Namespace,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "sayedppqq.dev/v1alpha1",
+					Kind:       "Kluster",
+					Name:       kluster.Name,
+					UID:        kluster.UID,
+					Controller: func() *bool {
+						var ok = true
+						return &ok
+					}(),
+				},
+			},
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: kluster.Spec.Replicas,
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
-					"app": "my-app",
+					"app":  kluster.Name,
+					"Kind": "Kluster",
 				},
 			},
 			Template: v1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
-						"app": "my-app",
+						"app":  kluster.Name,
+						"Kind": "Kluster",
 					},
 				},
 				Spec: v1.PodSpec{
 					Containers: []corev1.Container{
 						{
-							Name:  "my-app",
+							Name:  "my-kluster",
 							Image: kluster.Spec.Container.Image,
 							Ports: []corev1.ContainerPort{
 								{
@@ -302,4 +342,32 @@ func (c *Controller) updateKlusterStatus(kluster *controllerv1alpha1.Kluster, de
 	_, err := c.klusterclientset.SayedppqqV1alpha1().Klusters(kluster.Namespace).Update(context.TODO(), klusterCopy, metav1.UpdateOptions{})
 
 	return err
+}
+
+func newService(kluster *controllerv1alpha1.Kluster, serviceName string) *corev1.Service {
+	return &corev1.Service{
+		TypeMeta: metav1.TypeMeta{
+			Kind: "Service",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: serviceName,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(kluster, controllerv1alpha1.SchemeGroupVersion.WithKind("Kluster")),
+			},
+		},
+		Spec: v1.ServiceSpec{
+			Ports: []corev1.ServicePort{
+				{
+					Protocol:   "TCP",
+					Port:       kluster.Spec.Container.Port,
+					TargetPort: intstr.FromInt(int(kluster.Spec.Container.Port)),
+				},
+			},
+			Selector: map[string]string{
+				"app":  kluster.Name,
+				"Kind": "Kluster",
+			},
+			Type: corev1.ServiceTypeClusterIP,
+		},
+	}
 }
